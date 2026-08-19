@@ -88,6 +88,62 @@ terraform destroy
 | `max_replicas` | `3` | Tope de escalado horizontal |
 | `tags` | ver `variables.tf` | Etiquetas aplicadas a todos los recursos |
 
+## Relación con el pipeline de CI/CD
+
+Terraform **crea** la infraestructura; el pipeline del repo `mod3_eva_final_app`
+**actualiza la imagen** de la Container App en cada merge a `main` con
+`az containerapp update`.
+
+```
+mod3_eva_final_infra   terraform apply        → crea la infra (manual, una vez)
+mod3_eva_final_app     merge a main           → actualiza la imagen (automático)
+```
+
+Para que ambos convivan, `azurerm_container_app` lleva en [`main.tf`](main.tf):
+
+```hcl
+lifecycle {
+  ignore_changes = [
+    template[0].container[0].image,
+  ]
+}
+```
+
+Sin eso, Terraform vería el tag desplegado por el pipeline como una desviación y
+el siguiente `apply` lo revertiría a `var.container_image`, deshaciendo el último
+despliegue. Con el `ignore_changes`, `var.container_image` es solo la imagen con
+la que nace la app y de ahí en adelante el tag lo manda el CD.
+
+El resto de atributos (réplicas, CPU, memoria, probes, `GREETING_NAME`) sí sigue
+gobernado por Terraform: cambiarlos aquí y hacer `apply` es lo correcto.
+
+### Orden de operaciones
+
+1. `terraform apply` en este repositorio.
+2. Cargar los secrets en el repo `mod3_eva_final_app`.
+3. Merge a `main` → el pipeline despliega.
+
+Invertir 1 y 3 hace fallar el pipeline: no se puede actualizar una app que aún
+no existe.
+
+### Identidad que usa el pipeline
+
+El despliegue no usa credenciales de larga vida. Hay una app registration
+(`gh-mod3-eva-final`) con rol **Contributor** en la suscripción y una credencial
+federada que solo acepta tokens de `refs/heads/main` de ese repositorio. Este
+repositorio no necesita ningún secret configurado en GitHub: el `apply` se corre
+en local con la sesión de `az login`.
+
+Una vez creada la infraestructura se puede reducir el privilegio del service
+principal del alcance de la suscripción al del resource group:
+
+```bash
+az role assignment create --assignee <client-id> --role Contributor \
+  --scope "/subscriptions/<sub-id>/resourceGroups/rg-mod3-eva-final"
+az role assignment delete --assignee <client-id> \
+  --scope "/subscriptions/<sub-id>"
+```
+
 ## Estado de Terraform
 
 El estado se guarda **en local** (`terraform.tfstate`), excluido del control de
