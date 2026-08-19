@@ -73,4 +73,15 @@ resource "azurerm_container_app" "this" {
       percentage      = 100
     }
   }
+
+  # El pipeline de CD del repo mod3_eva_final_app despliega cada commit con
+  # `az containerapp update --image <repo>:<sha>`. Terraform vería ese tag como
+  # una desviación y el siguiente `apply` lo revertiría a var.container_image,
+  # deshaciendo el último despliegue. Aquí var.container_image queda como la
+  # imagen con la que nace la app; a partir de entonces el tag lo manda el CD.
+  lifecycle {
+    ignore_changes = [
+      template[0].container[0].image,
+    ]
+  }
 }
