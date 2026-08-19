@@ -1,0 +1,17 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# El tfvars puede contener IDs de suscripción y otros datos propios del entorno.
+terraform.tfvars
+*.auto.tfvars
+
+.DS_Store

@@ -1,0 +1,6 @@
+# Copiar a terraform.tfvars y ajustar. terraform.tfvars está en .gitignore.
+
+subscription_id = "00000000-0000-0000-0000-000000000000"
+location        = "eastus"
+container_image = "docker.io/rac4na/mod3_eva_final:1.0.0"
+greeting_name   = "Daybid"
