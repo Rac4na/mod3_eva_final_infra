@@ -63,6 +63,30 @@ variable "max_replicas" {
   default     = 3
 }
 
+variable "secret_name" {
+  description = "Nombre del secreto en el Key Vault. Solo alfanumericos y guiones."
+  type        = string
+  default     = "secreto-demo"
+
+  validation {
+    condition     = can(regex("^[a-zA-Z0-9-]+$", var.secret_name))
+    error_message = "secret_name solo admite letras, numeros y guiones."
+  }
+}
+
+variable "secret_value" {
+  description = <<-EOT
+    Valor del secreto que expone /secreto. Es un valor de demostracion para la
+    evaluacion, no una credencial real: queda versionado en este repositorio y
+    en claro en el tfstate. Para un secreto de verdad, pasarlo por
+    terraform.tfvars (que esta en .gitignore) o crearlo aparte con
+    `az keyvault secret set`.
+  EOT
+  type        = string
+  default     = "mi-secreto-de-prueba-mod3"
+  sensitive   = true
+}
+
 variable "tags" {
   description = "Etiquetas aplicadas a todos los recursos."
   type        = map(string)
