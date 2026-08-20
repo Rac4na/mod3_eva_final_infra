@@ -6,17 +6,31 @@ terraform {
       source  = "hashicorp/azurerm"
       version = "~> 4.0"
     }
+    # Solo para esperar a que se propague el RBAC del Key Vault antes de
+    # escribir el secreto. Ver keyvault.tf.
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.12"
+    }
   }
 
-  # Estado local. Para trabajo en equipo conviene un backend remoto
-  # (Azure Storage) y así evitar conflictos sobre el archivo de estado.
+  # Estado remoto en Azure Storage. Es obligatorio para que el pipeline pueda
+  # aplicar: un runner de GitHub arranca sin nada, y con estado local creería
+  # que la infraestructura no existe e intentaría crearla de cero.
   #
-  # backend "azurerm" {
-  #   resource_group_name  = "rg-tfstate"
-  #   storage_account_name = "sttfstatemod3"
-  #   container_name       = "tfstate"
-  #   key                  = "mod3-eva-final.tfstate"
-  # }
+  # El storage account se crea fuera de Terraform (con az CLI) a propósito: si
+  # lo gestionara este mismo código, el estado tendría que existir antes de
+  # poder crear el sitio donde se guarda.
+  #
+  # use_azuread_auth evita manejar la access key del storage account: el acceso
+  # se concede con el rol Storage Blob Data Contributor sobre la cuenta.
+  backend "azurerm" {
+    resource_group_name  = "rg-tfstate"
+    storage_account_name = "sttfstate5fb84928"
+    container_name       = "tfstate"
+    key                  = "mod3-eva-final.tfstate"
+    use_azuread_auth     = true
+  }
 }
 
 provider "azurerm" {
