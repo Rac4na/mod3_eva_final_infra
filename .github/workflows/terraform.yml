@@ -1,0 +1,187 @@
+name: Terraform CI/CD
+
+# Mismo esquema git-flow que el repo de la aplicación: develop valida, main
+# aplica. La diferencia es el riesgo — aquí un apply puede destruir recursos,
+# no solo cambiar una imagen — así que el plan se genera una vez, se guarda
+# como artefacto y el apply ejecuta exactamente ese plan y no otro.
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  TF_VERSION: "1.15.8"
+
+  # El provider y el backend se autentican por OIDC con la identidad federada,
+  # igual que el pipeline de la app. Ninguna de estas variables es un secreto
+  # en sentido estricto: son identificadores.
+  ARM_USE_OIDC: true
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Comprobaciones que no necesitan hablar con Azure. Van primero porque son
+  # segundos y detectan la mayoría de los errores de sintaxis y formato.
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Formato y sintaxis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      # -backend=false evita necesitar credenciales solo para validar sintaxis.
+      - name: terraform init (sin backend)
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+  # ---------------------------------------------------------------------------
+  # Calcula el plan contra el estado real. Necesita credenciales porque lee el
+  # estado remoto y refresca los recursos existentes.
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Plan
+    needs: validate
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write # emitir el token OIDC
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          # Sin wrapper, para que la salida del plan se pueda redirigir a un
+          # archivo sin los adornos que añade el wrapper de la acción.
+          terraform_wrapper: false
+
+      - name: terraform init
+        run: terraform init -input=false
+
+      # -detailed-exitcode: 0 sin cambios, 2 con cambios, 1 error. Se captura
+      # para distinguir "no hay nada que hacer" de "ha fallado".
+      - name: terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -no-color -input=false -out=tfplan -detailed-exitcode
+          CODE=$?
+          set -e
+          echo "exitcode=$CODE" >> "$GITHUB_OUTPUT"
+          if [ "$CODE" = "1" ]; then
+            echo "El plan ha fallado."
+            exit 1
+          fi
+          terraform show -no-color tfplan > plan.txt
+          echo "cambios=$([ "$CODE" = "2" ] && echo si || echo no)" >> "$GITHUB_OUTPUT"
+
+      # El plan es el artefacto de este pipeline, igual que la imagen Docker lo
+      # es en el repo de la app: lo que se revisa es lo que se aplica.
+      - name: Guardar el plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: |
+            tfplan
+            plan.txt
+          retention-days: 5
+
+      - name: Resumen del plan
+        run: |
+          {
+            echo "### Plan de Terraform"
+            echo ""
+            if [ "${{ steps.plan.outputs.cambios }}" = "no" ]; then
+              echo "Sin cambios: la infraestructura coincide con la configuración."
+            else
+              echo "Recursos afectados:"
+              echo ""
+              echo '```'
+              grep -E "^  # |^Plan:" plan.txt || true
+              echo '```'
+              echo ""
+              echo "<details><summary>Plan completo</summary>"
+              echo ""
+              echo '```terraform'
+              head -c 60000 plan.txt
+              echo '```'
+              echo ""
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Un apply que destruye recursos casi nunca es lo que se busca en este
+      # proyecto, así que se avisa de forma visible en lugar de que pase
+      # desapercibido entre las líneas del plan.
+      - name: Avisar si el plan destruye algo
+        run: |
+          if grep -qE "^Plan:.*[1-9][0-9]* to destroy" plan.txt; then
+            LINEA=$(grep -E "^Plan:" plan.txt)
+            echo "::warning title=El plan destruye recursos::$LINEA"
+            {
+              echo ""
+              echo "> **Atención:** este plan destruye recursos."
+              echo "> \`$LINEA\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Aplica el plan guardado. Solo cuando main avanza.
+  # ---------------------------------------------------------------------------
+  apply:
+    name: Apply
+    needs: plan
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Recuperar el plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+
+      # init de nuevo porque este job arranca en una máquina limpia: hace falta
+      # descargar los providers para poder leer el plan binario.
+      - name: terraform init
+        run: terraform init -input=false
+
+      # Se aplica el archivo tfplan, no la configuración. Así es imposible que
+      # se aplique algo distinto de lo que se calculó y quedó registrado.
+      - name: terraform apply
+        run: terraform apply -no-color -input=false -auto-approve tfplan
+
+      - name: Resumen del despliegue
+        run: |
+          {
+            echo "### Infraestructura aplicada"
+            echo ""
+            echo '```'
+            terraform output -no-color
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

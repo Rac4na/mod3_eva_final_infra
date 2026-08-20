@@ -15,10 +15,17 @@ en Docker Hub.
 | `azurerm_log_analytics_workspace` | Destino de los logs (lo exige el environment) |
 | `azurerm_container_app_environment` | Frontera de red y observabilidad de las apps |
 | `azurerm_container_app` | La aplicación, con ingress público en HTTPS |
+| `azurerm_key_vault` | Almacén del secreto que expone `/secreto` |
+| `azurerm_key_vault_secret` | El secreto en sí |
+| `azurerm_user_assigned_identity` | Identidad con la que la app lee el secreto |
+| `azurerm_role_assignment` (×2) | Permisos de lectura (app) y escritura (Terraform) |
 
 ```
 Resource Group  (rg-mod3-eva-final)
  ├── Log Analytics Workspace   (log-mod3-eva-final)
+ ├── Key Vault                 (kv-mod3-eva-fin-<sufijo>)
+ │    └── Secret               (secreto-demo)
+ ├── User Assigned Identity    (id-mod3-eva-final)
  └── Container App Environment (cae-mod3-eva-final)
       └── Container App        (ca-mod3-eva-final)  → HTTPS público
 ```
@@ -27,12 +34,130 @@ Resource Group  (rg-mod3-eva-final)
 
 ```
 .
-├── providers.tf              # versiones y configuración del provider azurerm
+├── .github/workflows/
+│   └── terraform.yml         # validate → plan → apply
+├── providers.tf              # versiones, backend remoto y provider azurerm
 ├── variables.tf              # parámetros de entrada
-├── main.tf                   # definición de los recursos
+├── main.tf                   # resource group, environment y container app
+├── keyvault.tf               # Key Vault, identidad y permisos
 ├── outputs.tf                # FQDN y URLs resultantes
+├── .terraform.lock.hcl       # versiones exactas de los providers (versionado)
 └── terraform.tfvars.example  # plantilla de valores
 ```
+
+## El secreto y el Key Vault
+
+La app expone en `/secreto` un valor guardado en Key Vault. Lo relevante es
+**cómo llega hasta el contenedor**: la aplicación no habla con Key Vault ni
+incluye el SDK de Azure. La plataforma resuelve el secreto y lo entrega como
+variable de entorno.
+
+```
+Key Vault ── secreto-demo
+    │
+    │  la plataforma lo lee usando la identidad de la app
+    ▼
+Container App
+    ├── secret { key_vault_secret_id, identity }
+    └── env    { name = "SECRETO_DEMO", secret_name = ... }
+              │
+              ▼
+        os.getenv("SECRETO_DEMO")   ← todo lo que hace la app
+```
+
+La ventaja no es solo tener menos código: el endpoint se puede probar en local
+y en CI con un simple `-e SECRETO_DEMO=...`, sin necesidad de Azure ni de
+mockear nada.
+
+### Por qué una identidad *user assigned*
+
+Es el detalle menos evidente del diseño. Con una identidad *system assigned*
+—la que nace junto a la Container App— aparece una dependencia circular:
+Terraform necesita el `principal_id` de la app para concederle el permiso, pero
+la app necesita ese permiso ya concedido para resolver el secreto al arrancar.
+
+Creando la identidad como recurso propio el orden queda lineal:
+
+```
+azurerm_user_assigned_identity  →  role assignment  →  azurerm_container_app
+```
+
+### Sobre el valor del secreto
+
+`var.secret_value` tiene un valor de demostración escrito en `variables.tf`, y
+este repositorio es público: **no es una credencial real y no debe usarse como
+tal**. Para un secreto de verdad, las dos opciones son pasarlo por
+`terraform.tfvars` (que está en `.gitignore`) o crearlo aparte:
+
+```bash
+az keyvault secret set --vault-name <vault> --name secreto-demo --value "..."
+```
+
+Conviene recordar también que exponer el valor de un secreto en un endpoint
+público anula el propósito de un Key Vault. Aquí se hace porque el ejercicio lo
+pide; en un sistema real el endpoint devolvería metadatos (que la lectura
+funciona, el nombre, la versión) y nunca el valor.
+
+## CI/CD de este repositorio
+
+El pipeline está en
+[`.github/workflows/terraform.yml`](.github/workflows/terraform.yml) y sigue el
+mismo git-flow que el repo de la aplicación:
+
+```
+push a develop ──────► fmt + validate + plan            (CI)
+
+PR develop → main ───► fmt + validate + plan            (CI)
+
+merge a main ────────► fmt + validate + plan
+                       └─ apply del plan guardado       (CD)
+```
+
+### El plan es el artefacto
+
+Igual que en el repo de la app el artefacto es la imagen Docker, aquí es el
+**plan**. El job `plan` genera `tfplan`, lo sube como artefacto, y el job
+`apply` lo descarga y ejecuta `terraform apply tfplan`.
+
+Se aplica el archivo y no la configuración a propósito: garantiza que lo que se
+ejecuta es exactamente lo que se calculó y quedó registrado, sin margen a que
+algo haya cambiado entre el plan y el apply.
+
+El pipeline además emite un **warning visible** si el plan destruye recursos.
+En infraestructura un `apply` no es como actualizar una imagen: puede borrar
+cosas, y un `1 to destroy` es fácil que pase desapercibido entre las líneas de
+un plan largo.
+
+### Secrets requeridos
+
+En `Settings → Secrets and variables → Actions`:
+
+| Secret | |
+|---|---|
+| `AZURE_CLIENT_ID` | App registration `gh-mod3-eva-final` |
+| `AZURE_TENANT_ID` | Tenant de Entra ID |
+| `AZURE_SUBSCRIPTION_ID` | Suscripción de Azure |
+
+Sin contraseñas: la autenticación es por OIDC federado, igual que en el repo de
+la app. Terraform lo consume a través de `ARM_USE_OIDC` y las variables `ARM_*`
+declaradas en el workflow.
+
+Hay tres credenciales federadas registradas en Entra ID para este repositorio
+(`refs/heads/main`, `refs/heads/develop` y `pull_request`). Las tres son
+necesarias porque **incluso el `plan` requiere credenciales**: lee el estado
+remoto y refresca los recursos existentes contra la API de Azure.
+
+### Permisos del service principal
+
+| Rol | Alcance | Por qué |
+|---|---|---|
+| `Contributor` | suscripción | Crear y modificar los recursos |
+| `User Access Administrator` | suscripción | Crear los role assignments del Key Vault |
+| `Storage Blob Data Contributor` | storage del estado | Leer y escribir el `tfstate` |
+
+El segundo suele ser una sorpresa: **`Contributor` no puede crear role
+assignments**. Como este código concede permisos sobre el Key Vault, sin ese rol
+extra el pipeline falla con `AuthorizationFailed`.
 
 ## Requisitos previos
 
@@ -128,27 +253,46 @@ no existe.
 
 ### Identidad que usa el pipeline
 
-El despliegue no usa credenciales de larga vida. Hay una app registration
-(`gh-mod3-eva-final`) con rol **Contributor** en la suscripción y una credencial
-federada que solo acepta tokens de `refs/heads/main` de ese repositorio. Este
-repositorio no necesita ningún secret configurado en GitHub: el `apply` se corre
-en local con la sesión de `az login`.
-
-Una vez creada la infraestructura se puede reducir el privilegio del service
-principal del alcance de la suscripción al del resource group:
-
-```bash
-az role assignment create --assignee <client-id> --role Contributor \
-  --scope "/subscriptions/<sub-id>/resourceGroups/rg-mod3-eva-final"
-az role assignment delete --assignee <client-id> \
-  --scope "/subscriptions/<sub-id>"
-```
+Ninguno de los dos pipelines usa credenciales de larga vida contra Azure. Una
+sola app registration (`gh-mod3-eva-final`) sirve a ambos repositorios, con una
+credencial federada distinta por cada contexto de ejecución.
 
 ## Estado de Terraform
 
-El estado se guarda **en local** (`terraform.tfstate`), excluido del control de
-versiones porque almacena valores sensibles en claro. Para trabajo en equipo,
-en `providers.tf` está preparado —comentado— un backend remoto en Azure Storage.
+El estado vive **en Azure Storage**, no en local:
+
+```
+rg-tfstate
+ └── sttfstate5fb84928
+      └── tfstate (contenedor)
+           └── mod3-eva-final.tfstate
+```
+
+Esto es un requisito del pipeline, no una preferencia. Un runner de GitHub
+arranca sin nada: con estado local creería que la infraestructura no existe e
+intentaría crearla de cero, fallando con *"A resource with the ID already
+exists"*.
+
+Tres decisiones sobre ese almacenamiento:
+
+- **El storage account se crea fuera de Terraform** (con `az CLI`). Si lo
+  gestionara este mismo código, el estado tendría que existir antes de poder
+  crear el sitio donde se guarda.
+- **`use_azuread_auth`** en lugar de la access key del storage account: el
+  acceso se concede con el rol `Storage Blob Data Contributor`, así que no hay
+  ninguna clave que guardar ni rotar.
+- **Versionado de blobs activado**, para poder recuperar un estado anterior si
+  uno se corrompe. El `tfstate` es el punto único de fallo de todo Terraform.
+
+El estado sigue conteniendo valores sensibles en claro, y por eso el contenedor
+no es público y `*.tfstate` continúa en `.gitignore`.
+
+### Bloqueo de estado
+
+El backend `azurerm` toma un lease sobre el blob mientras opera, de modo que dos
+`apply` simultáneos no pueden corromper el estado: el segundo espera o falla con
+un error de lock. Es la otra razón por la que el estado compartido importa en
+cuanto hay un pipeline además de tu máquina.
 
 ## Nota sobre imágenes privadas
 
