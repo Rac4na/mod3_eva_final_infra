@@ -11,6 +11,18 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Todos los runs de este repositorio comparten un unico tfstate, y Terraform lo
+# bloquea mientras opera. Dos runs a la vez —dos pushes seguidos, o develop y
+# main solapandose— hacen que el segundo muera con "state blob is already
+# locked". El grupo es uno solo para todo el repo, no por rama, precisamente
+# porque el recurso en disputa es el estado y no la referencia de git.
+#
+# cancel-in-progress queda en false a proposito: cancelar un apply a medias
+# deja recursos creados fuera del estado. Es preferible encolar.
+concurrency:
+  group: terraform-state
+  cancel-in-progress: false
+
 env:
   TF_VERSION: "1.15.8"
 
